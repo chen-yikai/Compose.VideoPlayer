@@ -22,65 +22,124 @@ data class PlayerState(
     var title: String = "",
     var currentPosition: Float = 0f,
     var duration: Float = 0f,
+    var mediaUri: String = "",
+    var wasPlaying: Boolean = false, // Track if was playing before pause
 )
 
 class VideoPlayer : ViewModel() {
-    lateinit var player: ExoPlayer
+    private var _player: ExoPlayer? = null
+    val player: ExoPlayer get() = _player!!
+    val playerOrNull: ExoPlayer? get() = _player
 
     private val _playerState = MutableStateFlow(PlayerState())
     val playerState: StateFlow<PlayerState> = _playerState
-    var job: Job? = null
+    private var job: Job? = null
+    private var isPlayerInitialized = false
+    
+    // Saved state for configuration changes
+    private var savedPosition: Long = 0L
+    private var savedWasPlaying: Boolean = false
+    private var savedMediaItem: MediaItem? = null
 
     fun setMediaItem(mediaItem: MediaItem, context: Context) {
-        player = ExoPlayer.Builder(context).build().apply {
-            setMediaItem(mediaItem)
-            prepare()
-            playWhenReady = true
-            addListener(object : Listener {
-                override fun onEvents(player: Player, events: Player.Events) {
-                    super.onEvents(player, events)
-                    _playerState.update {
-                        it.copy(
-                            isPlaying = player.isPlaying,
-                            duration = player.duration.toFloat(),
-                            title = player.mediaMetadata.title.toString()
-                        )
-                    }
-                    job?.cancel()
-                    job = viewModelScope.launch {
-                        while (true) {
-                            _playerState.update {
-                                it.copy(currentPosition = player.currentPosition.toFloat())
+        if (!isPlayerInitialized) {
+            savedMediaItem = mediaItem
+            _player = ExoPlayer.Builder(context).build().apply {
+                setMediaItem(mediaItem)
+                prepare()
+                
+                // Restore saved state if available
+                if (savedPosition > 0) {
+                    seekTo(savedPosition)
+                    playWhenReady = savedWasPlaying
+                } else {
+                    playWhenReady = true // Start playing on first load
+                }
+                
+                addListener(object : Listener {
+                    override fun onEvents(player: Player, events: Player.Events) {
+                        super.onEvents(player, events)
+                        
+                        // Save current state for configuration changes
+                        savedPosition = player.currentPosition
+                        savedWasPlaying = player.isPlaying
+                        
+                        _playerState.update {
+                            it.copy(
+                                isPlaying = player.isPlaying,
+                                duration = player.duration.toFloat(),
+                                title = player.mediaMetadata.title.toString(),
+                                mediaUri = mediaItem.localConfiguration?.uri.toString(),
+                                wasPlaying = player.isPlaying
+                            )
+                        }
+                        
+                        job?.cancel()
+                        job = viewModelScope.launch {
+                            while (true) {
+                                _playerState.update {
+                                    it.copy(currentPosition = player.currentPosition.toFloat())
+                                }
+                                delay(500L)
                             }
-                            delay(500L)
                         }
                     }
-                }
-            })
+                })
+            }
+            isPlayerInitialized = true
+            _playerState.update { it.copy(ready = true) }
         }
-        _playerState.update { it.copy(ready = true) }
+    }
+    
+    fun reinitializePlayer(context: Context) {
+        if (savedMediaItem != null && _player == null) {
+            isPlayerInitialized = false // Reset initialization flag
+            setMediaItem(savedMediaItem!!, context)
+        }
     }
 
     fun toggle() {
-        if (player.isPlaying) player.pause() else player.play()
+        _player?.let {
+            if (it.isPlaying) it.pause() else it.play()
+        }
     }
 
     fun forward(time: Long) {
-        player.seekTo(player.currentPosition + time)
+        _player?.let {
+            it.seekTo(it.currentPosition + time)
+        }
     }
 
     fun reply(time: Long) {
-        player.seekTo(player.currentPosition - time)
+        _player?.let {
+            it.seekTo(it.currentPosition - time)
+        }
     }
 
     fun seekTo(time: Long) {
-        player.seekTo(time)
+        _player?.seekTo(time)
     }
 
     fun dispose() {
-        player.stop()
-        player.release()
-        _playerState.update { PlayerState() }
+        job?.cancel()
+        _player?.let {
+            // Save current state before disposal
+            savedPosition = it.currentPosition
+            savedWasPlaying = it.isPlaying
+            it.stop()
+            it.release()
+        }
+        _player = null
+        isPlayerInitialized = false
+        // Don't reset PlayerState completely - keep saved values
+        _playerState.update { 
+            it.copy(ready = false) 
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        dispose()
     }
 
 }
